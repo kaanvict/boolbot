@@ -8,7 +8,8 @@ in the background, with no terminal window.
 
 Double-click `setup.bat`. It installs FFmpeg, Deno and the Python packages if
 they are missing, asks for the bot token (saved to `.env`, which is never
-committed), and starts the bot. Python 3.10+ must already be installed.
+committed), and starts the bot. Python must already be installed (3.11 or newer
+recommended; 3.10 works but gets an older yt-dlp).
 
 ## Running
 

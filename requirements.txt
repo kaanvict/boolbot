@@ -1,5 +1,6 @@
 # discord.py 2.7+ is required: Discord only accepts voice connections that
 # support the DAVE (E2EE) protocol, which the [voice] extra provides via davey.
 discord.py[voice]>=2.7.1
-# [default] pulls in yt-dlp-ejs, needed for YouTube. Keep yt-dlp up to date.
-yt-dlp[default]>=2026.10.26
+# [default] pulls in yt-dlp-ejs, needed for YouTube. No version pin: the newest
+# release pip can install depends on your Python (latest yt-dlp needs 3.11+).
+yt-dlp[default]

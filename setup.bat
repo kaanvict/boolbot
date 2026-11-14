@@ -3,12 +3,27 @@ rem One-time setup: installs what BoolBot needs, asks for the token, starts the 
 setlocal
 cd /d "%~dp0"
 
-where python >nul 2>nul
-if errorlevel 1 (
-    echo Python was not found. Install it with:  winget install Python.Python.3.13
+echo "%~dp0" | find /i "\AppData\Local\Temp\" >nul
+if not errorlevel 1 (
+    echo This is running from inside the zip file.
+    echo Right-click the zip, choose "Extract All", then run setup.bat from the extracted folder.
     pause
     exit /b 1
 )
+
+rem Prefer Python 3.11+ (needed for the newest yt-dlp); fall back to whatever "python" is.
+set "PY="
+for %%V in (3.13 3.12 3.11) do if not defined PY (py -%%V -c "" >nul 2>nul && set "PY=py -%%V")
+if not defined PY set "PY=python"
+%PY% -c "" >nul 2>nul
+if errorlevel 1 (
+    echo Python was not found. Install it with:  winget install Python.Python.3.13
+    echo Then run setup.bat again.
+    pause
+    exit /b 1
+)
+echo Using:
+%PY% --version
 
 where ffmpeg >nul 2>nul
 if errorlevel 1 if not exist "%LOCALAPPDATA%\Microsoft\WinGet\Packages\Gyan.FFmpeg*" (
@@ -26,9 +41,10 @@ winget install -e --id DenoLand.Deno --accept-source-agreements --accept-package
 
 if not exist ".venv\Scripts\python.exe" (
     echo Creating Python environment...
-    python -m venv .venv
+    %PY% -m venv .venv
 )
 echo Installing Python packages...
+".venv\Scripts\python.exe" -m pip install -q -U pip
 ".venv\Scripts\python.exe" -m pip install -q -U -r requirements.txt
 if errorlevel 1 (
     echo Package install failed. See the messages above.
