@@ -3,7 +3,7 @@ rem One-time setup: installs what BoolBot needs, asks for the token, starts the 
 setlocal
 cd /d "%~dp0"
 
-echo "%~dp0" | find /i "\AppData\Local\Temp\" >nul
+echo "%~dp0" | find /i "\AppData\Local\Temp" >nul
 if not errorlevel 1 (
     echo This is running from inside the zip file.
     echo Right-click the zip, choose "Extract All", then run setup.bat from the extracted folder.
