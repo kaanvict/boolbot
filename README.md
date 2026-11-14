@@ -6,17 +6,9 @@ in the background, with no terminal window.
 
 ## Setup (once)
 
-1. Install Python 3.10+, [FFmpeg](https://ffmpeg.org/) (`winget install Gyan.FFmpeg`)
-   and a JavaScript runtime for yt-dlp (`winget install DenoLand.Deno`, or Node.js).
-2. In this folder:
-
-   ```bat
-   python -m venv .venv
-   .venv\Scripts\pip install -r requirements.txt
-   copy .env.example .env
-   ```
-
-3. Put the bot token in `.env` (`DISCORD_TOKEN=...`). Never commit `.env`.
+Double-click `setup.bat`. It installs FFmpeg, Deno and the Python packages if
+they are missing, asks for the bot token (saved to `.env`, which is never
+committed), and starts the bot. Python 3.10+ must already be installed.
 
 ## Running
 
