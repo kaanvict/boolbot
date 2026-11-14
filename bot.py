@@ -3,6 +3,8 @@ from discord import app_commands
 from discord.ext import commands
 import yt_dlp
 import asyncio
+import logging
+import os
 import subprocess
 import shlex
 
@@ -409,4 +411,12 @@ async def nowplaying(interaction: discord.Interaction):
     )
 
 
-bot.run(TOKEN)
+# Background runs have no console, so everything discord.py reports (logins,
+# disconnects, command errors) goes to boolbot.log next to this file.
+LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "boolbot.log")
+
+try:
+    bot.run(TOKEN, log_handler=logging.FileHandler(LOG_PATH, encoding="utf-8"))
+except Exception:
+    logging.getLogger("discord").exception("BoolBot stopped with an error")
+    raise
