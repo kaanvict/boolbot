@@ -74,7 +74,7 @@ batch_ids = itertools.count(1)  # tags each artist batch so /skipartist can drop
 current_source: dict[int, "YTDLSource"] = {}  # for elapsed time
 panels: dict[int, discord.Message] = {}  # guild -> live now-playing message
 panel_channel: dict[int, int] = {}  # guild -> channel id of the last command (fallback home)
-PANEL_REFRESH = 5  # seconds
+PANEL_REFRESH = 1  # seconds (about the most Discord allows per channel)
 radio_off: set[int] = set()  # guilds that turned endless radio off
 played_ids: dict[int, list[str]] = {}  # recent video ids per guild, so radio avoids repeats
 RADIO_BATCH = 10
@@ -438,11 +438,16 @@ def build_embed(guild):
     queue = get_queue(guild.id)
 
     status = "⏸  Paused" if paused else "▶  Playing"
+    remaining = (track.get("duration") or 0) - elapsed
+    ends = ""
+    if not paused and remaining > 0:
+        # Discord renders this client-side and keeps it ticking between edits.
+        ends = f" · ends <t:{int(time.time() + remaining)}:R>"
     where = f" in **{vc.channel.name}**" if vc and vc.channel else ""
     e = discord.Embed(
         title=trim(track["title"], 250),
         url=track["webpage_url"],
-        description=f"{status}{where}\n\n{progress_bar(elapsed, track.get('duration'))}",
+        description=f"{status}{where}{ends}\n\n{progress_bar(elapsed, track.get('duration'))}",
         color=ACCENT_PAUSED if paused else ACCENT_PLAYING,
     )
     e.set_author(name="Now Playing", icon_url=bot.user.display_avatar.url)
@@ -474,7 +479,7 @@ def build_embed(guild):
     if known:
         footer += f" · {fmt(known)}+ of music"
     footer += " · radio " + ("off" if guild.id in radio_off else "on")
-    e.set_footer(text=footer + f" · live, updates every {PANEL_REFRESH}s")
+    e.set_footer(text=footer + " · live")
     return e
 
 
@@ -603,24 +608,38 @@ async def post_panel(guild, channel=None):
     save_panels()
 
 
+editing: set[int] = set()  # guilds with a panel edit still in flight
+_bg_tasks: set[asyncio.Task] = set()
+
+
 async def refresh_panel(guild):
+    """Edit the panel with fresh state. If the previous edit hasn't finished yet,
+    skip: the next tick builds a fresh card anyway, so nothing backs up."""
     msg = panels.get(guild.id)
-    if not msg:
+    if not msg or guild.id in editing:
         return
+    editing.add(guild.id)
     try:
         await msg.edit(embed=build_embed(guild), view=panel_controls(guild))
     except discord.NotFound:
         forget_panel(guild.id)
     except discord.HTTPException:
         pass
+    finally:
+        editing.discard(guild.id)
 
 
 @tasks.loop(seconds=PANEL_REFRESH)
 async def panel_loop():
+    # Fire-and-forget per guild so one slow edit never delays the others or the loop.
     for gid in list(panels):
         guild = bot.get_guild(gid)
-        if guild and current_track.get(gid):
-            await refresh_panel(guild)
+        vc = guild.voice_client if guild else None
+        if not guild or not current_track.get(gid) or (vc and vc.is_paused()):
+            continue  # nothing changes while idle or paused
+        task = asyncio.create_task(refresh_panel(guild))
+        _bg_tasks.add(task)  # keep a reference so it isn't garbage-collected mid-edit
+        task.add_done_callback(_bg_tasks.discard)
 
 
 async def set_presence(track):
