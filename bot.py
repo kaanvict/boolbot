@@ -3,6 +3,7 @@
 Run hidden (no console) with BoolBot.vbs; logs go to boolbot.log.
 """
 import asyncio
+import itertools
 import logging
 import os
 import shutil
@@ -66,6 +67,7 @@ queues: dict[int, list[dict]] = {}
 current_track: dict[int, dict] = {}
 loading: set[int] = set()  # guilds currently fetching a stream
 artist_session: dict[int, dict] = {}  # guild -> {query, seen titles} for /more
+batch_ids = itertools.count(1)  # tags each artist batch so /skipartist can drop it
 
 
 def get_queue(guild_id):
@@ -406,6 +408,8 @@ async def play(interaction: discord.Interaction, query: str = None):
 
 async def play_artist(interaction, vc, query, tracks):
     artist_session[interaction.guild_id] = {"query": query, "seen": {t["title"].lower() for t in tracks}}
+    batch = next(batch_ids)
+    tracks = [dict(t, batch=batch, artist=query) for t in tracks]
     queue = get_queue(interaction.guild_id)
     listing = "\n".join(f"{i}. {t['title']}" for i, t in enumerate(tracks, 1))
     busy = vc.is_playing() or vc.is_paused() or interaction.guild_id in loading
@@ -419,7 +423,6 @@ async def play_artist(interaction, vc, query, tracks):
         await play_next(interaction.guild)
         return
     await announce(interaction.guild, msg[:2000], skip_channel_id=interaction.channel_id)
-    await announce(interaction.guild, msg, skip_channel_id=interaction.channel_id)
 
 
 @bot.tree.command(name="add", description="Add a track to the queue")
@@ -513,13 +516,35 @@ async def more(interaction: discord.Interaction):
         await interaction.followup.send(f"That's everything I can find for **{session['query']}**.")
         return
     session["seen"].update(t["title"].lower() for t in fresh)
-    queues[interaction.guild_id] = list(fresh)
+    batch = next(batch_ids)
+    queues[interaction.guild_id] = [dict(t, batch=batch, artist=session["query"]) for t in fresh]
     listing = "\n".join(f"{i}. {t['title']}" for i, t in enumerate(fresh, 1))
     await interaction.followup.send(f"Next {len(fresh)} for **{session['query']}**:\n{listing}"[:2000])
     if vc.is_playing() or vc.is_paused():
         vc.stop()  # 'after' callback starts the first of the new batch
     else:
         await play_next(interaction.guild)
+
+
+@bot.tree.command(name="skipartist", description="Skip the rest of the current artist and move on to what's queued next")
+@app_commands.guild_only()
+async def skipartist(interaction: discord.Interaction):
+    vc = interaction.guild.voice_client
+    now = current_track.get(interaction.guild_id)
+    if not vc or not (vc.is_playing() or vc.is_paused()) or not now:
+        await interaction.response.send_message("Nothing is playing.")
+        return
+    batch = now.get("batch")
+    if not batch:
+        await interaction.response.send_message("This song isn't part of an artist batch. Use `/skip`.")
+        return
+    queue = get_queue(interaction.guild_id)
+    dropped = sum(1 for t in queue if t.get("batch") == batch)
+    queue[:] = [t for t in queue if t.get("batch") != batch]
+    msg = f"Skipped the rest of **{now.get('artist', 'this artist')}** ({dropped + 1} songs)."
+    msg += f" Up next: {label(queue[0])}" if queue else " Queue is now empty."
+    vc.stop()  # 'after' callback starts the next track
+    await interaction.response.send_message(msg)
 
 
 @bot.tree.command(name="skip", description="Skip the current track")
