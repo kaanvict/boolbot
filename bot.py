@@ -804,7 +804,7 @@ def requester(interaction):
 
 
 @bot.tree.command(name="play", description="Play a song or an artist's top songs (empty = resume)")
-@app_commands.describe(query="Song, artist, YouTube URL, or a comma-separated list (empty = resume)")
+@app_commands.describe(query="Song, artist, URL, or a list: 'a, b, c' or 'artist: a, b, c' (empty = resume)")
 @app_commands.guild_only()
 async def play(interaction: discord.Interaction, query: str = None):
     await interaction.response.defer()
@@ -835,11 +835,22 @@ MAX_LIST = 15
 
 
 def split_query(query):
-    """'kyoto, ginseng strip 2002, oreomilkshake' -> three searches. A lone URL is never split."""
+    """'kyoto, ginseng strip 2002, oreomilkshake' -> three searches. A lone URL is never split.
+
+    'yung lean: kyoto, ginseng strip' applies the artist before the colon to every item
+    (links in the list are left alone)."""
     q = query.strip()
     if re.fullmatch(r"https?://\S+", q):
         return [q]
-    return [p.strip() for p in q.split(",") if p.strip()][:MAX_LIST]
+    artist = ""
+    m = re.match(r"([^:,/]+):(?!//)\s*(.+)", q)
+    if m:
+        artist, q = m.group(1).strip(), m.group(2)
+    parts = [p.strip() for p in q.split(",") if p.strip()][:MAX_LIST]
+    if artist:
+        parts = [p if re.match(r"https?://", p) or artist.lower() in p.lower() else f"{artist} {p}"
+                 for p in parts]
+    return parts
 
 
 async def search_many(parts, who):
@@ -887,6 +898,8 @@ async def handle_play(interaction, query):
             await interaction.followup.send(list_reply(tracks, 1, missing, verb="Playing"))
             await play_next(interaction.guild)
         return
+    if parts:
+        query = parts[0]  # e.g. 'yung lean: kyoto' -> 'yung lean kyoto'
 
     tracks = await asyncio.to_thread(artist_tracks, query)
     if tracks:
