@@ -76,6 +76,7 @@ panels: dict[int, discord.Message] = {}  # guild -> live now-playing message
 panel_channel: dict[int, int] = {}  # guild -> channel id of the last command (fallback home)
 PANEL_REFRESH = 1  # seconds (about the most Discord allows per channel)
 radio_off: set[int] = set()  # guilds that turned endless radio off
+status_channel: dict[int, int] = {}  # guild -> voice channel whose status we set
 played_ids: dict[int, list[str]] = {}  # recent video ids per guild, so radio avoids repeats
 RADIO_BATCH = 10
 
@@ -344,10 +345,21 @@ async def refill_radio(guild):
 async def set_vc_status(guild, text):
     """The little status line under the voice channel, visible to the whole server."""
     vc = guild.voice_client
-    if not vc or not vc.channel:
-        return
+    if text:
+        if not vc or not vc.channel:
+            return
+        channel_id = vc.channel.id
+        old = status_channel.get(guild.id)
+        if old and old != channel_id:
+            await set_vc_status(guild, None)  # moved channels: clear the old one
+        status_channel[guild.id] = channel_id
+    else:
+        # Clearing: use the remembered channel, since we may have already left it.
+        channel_id = status_channel.pop(guild.id, None) or (vc.channel.id if vc and vc.channel else None)
+        if not channel_id:
+            return
     try:
-        await bot.http.edit_voice_channel_status(trim(text, 500) if text else None, channel_id=vc.channel.id)
+        await bot.http.edit_voice_channel_status(trim(text, 500) if text else None, channel_id=channel_id)
     except discord.HTTPException as e:
         log.info("Couldn't set voice channel status (%s)", e.status)
 
@@ -375,7 +387,7 @@ async def play_next(guild):
 
 
 async def end_session(guild, note="Nothing playing."):
-    if guild.id in current_track:
+    if guild.id in status_channel:
         await set_vc_status(guild, None)
     current_track.pop(guild.id, None)
     current_source.pop(guild.id, None)
@@ -704,6 +716,7 @@ async def do_stop(guild):
     vc = guild.voice_client
     if vc:
         vc.stop()
+        await set_vc_status(guild, None)  # clear while still in the channel
         await vc.disconnect(force=True)
     await end_session(guild, "Stopped.")
 
