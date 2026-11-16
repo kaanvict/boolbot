@@ -15,6 +15,7 @@ import re
 import urllib.parse
 import urllib.request
 import html
+import json
 from pathlib import Path
 
 import discord
@@ -360,7 +361,7 @@ async def play_next(guild):
     if vc.is_playing() or vc.is_paused() or guild.id in loading:
         return
     if not queue and not await refill_radio(guild):
-        await end_session(guild, "Queue finished. Use `/play` to keep the music going.")
+        await end_session(guild, "Queue finished.")
         return
     if vc.is_playing() or vc.is_paused() or not queue:
         return  # something else started playing while the radio was loading
@@ -373,15 +374,18 @@ async def play_next(guild):
         await play_next(guild)
 
 
-async def end_session(guild, note="Nothing playing. Use `/play` to start some music."):
+async def end_session(guild, note="Nothing playing."):
     if guild.id in current_track:
         await set_vc_status(guild, None)
     current_track.pop(guild.id, None)
     current_source.pop(guild.id, None)
-    msg = panels.pop(guild.id, None)
+    # Keep the panel message: it goes idle and gets reused for the next song.
+    msg = panels.get(guild.id)
     if msg:
         try:
             await msg.edit(embed=idle_embed(note), view=None)
+        except discord.NotFound:
+            forget_panel(guild.id)
         except discord.HTTPException:
             pass
     if not current_track:
@@ -414,8 +418,11 @@ def progress_bar(elapsed, duration):
     return f"`{fmt(elapsed) or '0:00'}`  {bar}  `{fmt(duration)}`"
 
 
-def idle_embed(note):
-    e = discord.Embed(description=note, color=ACCENT_IDLE)
+def idle_embed(note="Nothing playing."):
+    e = discord.Embed(
+        description=f"{note}\n\n`/play` a song, an artist, or a list like `kyoto, ginseng strip 2002`.",
+        color=ACCENT_IDLE,
+    )
     e.set_author(name="BoolBot Radio", icon_url=bot.user.display_avatar.url if bot.user else None)
     return e
 
@@ -423,7 +430,7 @@ def idle_embed(note):
 def build_embed(guild):
     track = current_track.get(guild.id)
     if not track:
-        return idle_embed("Nothing playing. Use `/play` to start some music.")
+        return idle_embed()
     vc = guild.voice_client
     paused = bool(vc and vc.is_paused())
     src = current_source.get(guild.id)
@@ -527,23 +534,73 @@ def panel_home(guild):
     return guild.get_channel(cid) if cid else None
 
 
+PANEL_STORE = HERE / "panels.json"  # remembers each server's player message across restarts
+
+
+def save_panels():
+    data = {str(gid): [m.channel.id, m.id] for gid, m in panels.items()}
+    try:
+        PANEL_STORE.write_text(json.dumps(data), encoding="utf-8")
+    except OSError:
+        log.exception("Couldn't save panels.json")
+
+
+def forget_panel(guild_id):
+    panels.pop(guild_id, None)
+    save_panels()
+
+
+async def restore_panels():
+    """After a restart, reattach to the existing player messages and mark them idle,
+    so no frozen 'Now Playing' cards are left behind."""
+    try:
+        data = json.loads(PANEL_STORE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    for gid, (cid, mid) in data.items():
+        channel = bot.get_channel(cid)
+        if not channel:
+            continue
+        msg = channel.get_partial_message(mid)
+        try:
+            await msg.edit(embed=idle_embed("BoolBot restarted. Nothing playing."), view=None)
+            panels[int(gid)] = msg
+        except discord.HTTPException:
+            pass
+    save_panels()
+
+
+def panel_controls(guild):
+    return PanelView(guild) if current_track.get(guild.id) else None
+
+
 async def post_panel(guild, channel=None):
-    """(Re)post the panel at the bottom of its channel, replacing the old one."""
-    old = panels.pop(guild.id, None)
+    """Show the player in its home channel. Reuses the existing message (edited in
+    place) when it's still the newest message there; otherwise reposts it at the
+    bottom so it isn't buried."""
+    home = channel or panel_home(guild)
+    if not home:
+        return
+    old = panels.get(guild.id)
+    if old and old.channel.id == home.id and getattr(home, "last_message_id", None) == old.id:
+        try:
+            await old.edit(embed=build_embed(guild), view=panel_controls(guild))
+            return
+        except discord.HTTPException:
+            pass  # deleted or broken: fall through and post a fresh one
     if old:
         try:
             await old.delete()
         except discord.HTTPException:
             pass
-    channel = channel or panel_home(guild)
-    if not channel:
-        return
     try:
-        panels[guild.id] = await channel.send(
-            embed=build_embed(guild), view=PanelView(guild), silent=True
+        panels[guild.id] = await home.send(
+            embed=build_embed(guild), view=panel_controls(guild), silent=True
         )
     except discord.HTTPException:
-        log.exception("Couldn't post panel in #%s", channel)
+        log.exception("Couldn't post panel in #%s", home)
+        panels.pop(guild.id, None)
+    save_panels()
 
 
 async def refresh_panel(guild):
@@ -551,9 +608,9 @@ async def refresh_panel(guild):
     if not msg:
         return
     try:
-        await msg.edit(embed=build_embed(guild), view=PanelView(guild))
+        await msg.edit(embed=build_embed(guild), view=panel_controls(guild))
     except discord.NotFound:
-        panels.pop(guild.id, None)
+        forget_panel(guild.id)
     except discord.HTTPException:
         pass
 
@@ -629,7 +686,7 @@ async def do_stop(guild):
     if vc:
         vc.stop()
         await vc.disconnect(force=True)
-    await end_session(guild, "Stopped. Use `/play` to start again.")
+    await end_session(guild, "Stopped.")
 
 
 async def ensure_voice(interaction):
@@ -658,6 +715,7 @@ async def ensure_voice(interaction):
 async def on_ready():
     log.info("BoolBot online as %s in %d guild(s)", bot.user, len(bot.guilds))
     if not panel_loop.is_running():
+        await restore_panels()
         panel_loop.start()
     if getattr(bot, "_synced", False):
         return
@@ -699,7 +757,7 @@ async def on_voice_state_update(member, before, after):
     if member.id == bot.user.id and before.channel and not after.channel:
         # Bot got disconnected (kicked, or channel deleted).
         queues.pop(guild.id, None)
-        await end_session(guild, "Disconnected from voice. Use `/play` to start again.")
+        await end_session(guild, "Disconnected from voice.")
         return
     if not vc or not vc.channel or member.bot:
         return
@@ -727,7 +785,7 @@ def requester(interaction):
 
 
 @bot.tree.command(name="play", description="Play a song or an artist's top songs (empty = resume)")
-@app_commands.describe(query="Song, artist or YouTube URL (leave empty to resume)")
+@app_commands.describe(query="Song, artist, YouTube URL, or a comma-separated list (empty = resume)")
 @app_commands.guild_only()
 async def play(interaction: discord.Interaction, query: str = None):
     await interaction.response.defer()
@@ -754,10 +812,61 @@ def enqueue(guild_id, tracks):
     return idx + 1
 
 
+MAX_LIST = 15
+
+
+def split_query(query):
+    """'kyoto, ginseng strip 2002, oreomilkshake' -> three searches. A lone URL is never split."""
+    q = query.strip()
+    if re.fullmatch(r"https?://\S+", q):
+        return [q]
+    return [p.strip() for p in q.split(",") if p.strip()][:MAX_LIST]
+
+
+async def search_many(parts, who):
+    """Search all parts at once; return (tracks in the given order, parts that failed)."""
+    results = await asyncio.gather(
+        *(asyncio.to_thread(search_track, p) for p in parts), return_exceptions=True
+    )
+    tracks, missing = [], []
+    for part, res in zip(parts, results):
+        if isinstance(res, Exception):
+            log.warning("Search failed for %r: %s", part, res)
+            missing.append(part)
+        else:
+            res["requester"] = who
+            tracks.append(res)
+    return tracks, missing
+
+
+def list_reply(tracks, start, missing, verb="Queued"):
+    lines = [f"🎶 {verb} {len(tracks)} songs:"]
+    lines += [f"`{start + i}.` {label(t)}" for i, t in enumerate(tracks)]
+    if missing:
+        lines.append("❓ Couldn't find: " + ", ".join(f"*{m}*" for m in missing))
+    return "\n".join(lines)[:2000]
+
+
 async def handle_play(interaction, query):
     """Shared by /play and the 'Play in voice' right-click command. Interaction must be deferred."""
     vc = await ensure_voice(interaction)
     if not vc:
+        return
+
+    parts = split_query(query)
+    if len(parts) > 1:
+        tracks, missing = await search_many(parts, requester(interaction))
+        if not tracks:
+            await interaction.followup.send("Couldn't find any of those.")
+            return
+        busy = vc.is_playing() or vc.is_paused() or interaction.guild_id in loading
+        pos = enqueue(interaction.guild_id, tracks)
+        if busy:
+            await interaction.followup.send(list_reply(tracks, pos, missing))
+            await refresh_panel(interaction.guild)
+        else:
+            await interaction.followup.send(list_reply(tracks, 1, missing, verb="Playing"))
+            await play_next(interaction.guild)
         return
 
     tracks = await asyncio.to_thread(artist_tracks, query)
@@ -804,26 +913,27 @@ async def play_artist(interaction, vc, query, tracks):
         await play_next(interaction.guild)
 
 
-@bot.tree.command(name="add", description="Add a song to the queue")
-@app_commands.describe(query="Song name or YouTube URL", position="Queue position (optional)")
+@bot.tree.command(name="add", description="Add songs to the queue (separate several with commas)")
+@app_commands.describe(query="Song name, YouTube URL, or a comma-separated list",
+                       position="Queue position (optional)")
 @app_commands.guild_only()
 async def add(interaction: discord.Interaction, query: str, position: int = None):
     await interaction.response.defer()
-    try:
-        track = await asyncio.to_thread(search_track, query)
-    except Exception:
-        log.exception("Search failed: %s", query)
+    tracks, missing = await search_many(split_query(query), requester(interaction))
+    if not tracks:
         await interaction.followup.send(f"Couldn't find anything for: {query}")
         return
-    track["requester"] = requester(interaction)
 
     queue = get_queue(interaction.guild_id)
     if position is not None:
         idx = max(0, min(position - 1, len(queue)))
-        queue.insert(idx, track)
+        queue[idx:idx] = tracks
     else:
-        idx = enqueue(interaction.guild_id, [track]) - 1
-    await interaction.followup.send(f"➕ Queued #{idx + 1}: {label(track)}")
+        idx = enqueue(interaction.guild_id, tracks) - 1
+    if len(tracks) == 1 and not missing:
+        await interaction.followup.send(f"➕ Queued #{idx + 1}: {label(tracks[0])}")
+    else:
+        await interaction.followup.send(list_reply(tracks, idx + 1, missing))
 
     vc = interaction.guild.voice_client
     if vc and vc.is_connected() and not (vc.is_playing() or vc.is_paused()) and interaction.guild_id not in loading:
