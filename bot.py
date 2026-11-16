@@ -13,6 +13,8 @@ import sys
 import time
 import re
 import urllib.parse
+import urllib.request
+import html
 from pathlib import Path
 
 import discord
@@ -72,6 +74,9 @@ current_source: dict[int, "YTDLSource"] = {}  # for elapsed time
 panels: dict[int, discord.Message] = {}  # guild -> live now-playing message
 panel_channel: dict[int, int] = {}  # guild -> channel id of the last command (fallback home)
 PANEL_REFRESH = 5  # seconds
+radio_off: set[int] = set()  # guilds that turned endless radio off
+played_ids: dict[int, list[str]] = {}  # recent video ids per guild, so radio avoids repeats
+RADIO_BATCH = 10
 
 
 def get_queue(guild_id):
@@ -278,8 +283,72 @@ async def start_track(guild, vc, track):
 
     vc.play(source, after=after)
     log.info("Now playing: %s", track["title"])
+    vid = video_id(track["webpage_url"])
+    if vid:
+        recent = played_ids.setdefault(guild.id, [])
+        recent.append(vid)
+        del recent[:-200]
     await set_presence(track)
+    await set_vc_status(guild, f"🎵 {track['title']}")
     await post_panel(guild)
+
+
+def mix_search(seed_id, exclude, limit=RADIO_BATCH):
+    """YouTube's auto-generated mix for a song, minus anything played recently."""
+    url = f"https://www.youtube.com/watch?v={seed_id}&list=RD{seed_id}"
+    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "extract_flat": True,
+                           "playlistend": limit + len(exclude) + 10}) as ydl:
+        info = ydl.extract_info(url, download=False)
+    out, seen = [], set(exclude)
+    for e in info.get("entries") or []:
+        if not e or not e.get("id") or e["id"] in seen or not e.get("title"):
+            continue
+        seen.add(e["id"])
+        out.append({
+            "title": e["title"],
+            "webpage_url": f"https://www.youtube.com/watch?v={e['id']}",
+            "duration": e.get("duration") or 0,
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def refill_radio(guild):
+    """Queue ran dry: top it up with a mix based on the song that just finished."""
+    if guild.id in radio_off:
+        return False
+    seed = current_track.get(guild.id)
+    seed_id = video_id(seed["webpage_url"]) if seed else None
+    if not seed_id:
+        return False
+    loading.add(guild.id)
+    try:
+        tracks = await asyncio.to_thread(mix_search, seed_id, played_ids.get(guild.id, []))
+    except Exception:
+        log.exception("Radio lookup failed")
+        return False
+    finally:
+        loading.discard(guild.id)
+    if not tracks:
+        return False
+    batch = next(batch_ids)
+    get_queue(guild.id).extend(
+        dict(t, batch=batch, artist="the radio", radio=seed["title"]) for t in tracks
+    )
+    log.info("Radio: queued %d songs based on %s", len(tracks), seed["title"])
+    return True
+
+
+async def set_vc_status(guild, text):
+    """The little status line under the voice channel, visible to the whole server."""
+    vc = guild.voice_client
+    if not vc or not vc.channel:
+        return
+    try:
+        await bot.http.edit_voice_channel_status(trim(text, 500) if text else None, channel_id=vc.channel.id)
+    except discord.HTTPException as e:
+        log.info("Couldn't set voice channel status (%s)", e.status)
 
 
 async def play_next(guild):
@@ -290,9 +359,11 @@ async def play_next(guild):
         return
     if vc.is_playing() or vc.is_paused() or guild.id in loading:
         return
-    if not queue:
+    if not queue and not await refill_radio(guild):
         await end_session(guild, "Queue finished. Use `/play` to keep the music going.")
         return
+    if vc.is_playing() or vc.is_paused() or not queue:
+        return  # something else started playing while the radio was loading
     track = queue.pop(0)
     try:
         await start_track(guild, vc, track)
@@ -303,6 +374,8 @@ async def play_next(guild):
 
 
 async def end_session(guild, note="Nothing playing. Use `/play` to start some music."):
+    if guild.id in current_track:
+        await set_vc_status(guild, None)
     current_track.pop(guild.id, None)
     current_source.pop(guild.id, None)
     msg = panels.pop(guild.id, None)
@@ -369,8 +442,10 @@ def build_embed(guild):
     vid = video_id(track["webpage_url"])
     if vid:
         e.set_thumbnail(url=f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg")
-    if track.get("artist"):
-        e.add_field(name="Artist mix", value=trim(track["artist"].title(), 100), inline=True)
+    if track.get("radio"):
+        e.add_field(name="📻 Radio", value="Based on " + trim(track["radio"], 90), inline=True)
+    elif track.get("artist"):
+        e.add_field(name="🎤 Artist mix", value=trim(track["artist"].title(), 100), inline=True)
     if track.get("requester"):
         e.add_field(name="Requested by", value=trim(track["requester"], 100), inline=True)
 
@@ -383,12 +458,15 @@ def build_embed(guild):
             lines.append(f"*…and {len(queue) - 5} more*")
         e.add_field(name="Up Next", value="\n".join(lines), inline=False)
     else:
-        e.add_field(name="Up Next", value="*Nothing queued. `/add` something.*", inline=False)
+        empty = ("*Nothing queued. Radio will keep it going.*" if guild.id not in radio_off
+                 else "*Nothing queued. `/add` something.*")
+        e.add_field(name="Up Next", value=empty, inline=False)
 
     known = sum(t.get("duration") or 0 for t in queue)
     footer = f"{len(queue)} in queue"
     if known:
         footer += f" · {fmt(known)}+ of music"
+    footer += " · radio " + ("off" if guild.id in radio_off else "on")
     e.set_footer(text=footer + f" · live, updates every {PANEL_REFRESH}s")
     return e
 
@@ -665,7 +743,19 @@ async def play(interaction: discord.Interaction, query: str = None):
         else:
             await interaction.followup.send("Give me a song, an artist or a URL.")
         return
+    await handle_play(interaction, query)
 
+
+def enqueue(guild_id, tracks):
+    """Add requested songs ahead of any auto-filled radio songs. Returns 1-based position."""
+    queue = get_queue(guild_id)
+    idx = next((i for i, t in enumerate(queue) if t.get("radio")), len(queue))
+    queue[idx:idx] = tracks
+    return idx + 1
+
+
+async def handle_play(interaction, query):
+    """Shared by /play and the 'Play in voice' right-click command. Interaction must be deferred."""
     vc = await ensure_voice(interaction)
     if not vc:
         return
@@ -684,10 +774,8 @@ async def play(interaction: discord.Interaction, query: str = None):
     track["requester"] = requester(interaction)
 
     if vc.is_playing() or vc.is_paused() or interaction.guild_id in loading:
-        queue = get_queue(interaction.guild_id)
-        queue.append(track)
-        msg = f"➕ Queued #{len(queue)}: {label(track)}"
-        await interaction.followup.send(msg)
+        pos = enqueue(interaction.guild_id, [track])
+        await interaction.followup.send(f"➕ Queued #{pos}: {label(track)}")
         await refresh_panel(interaction.guild)
         return
 
@@ -703,9 +791,8 @@ async def play_artist(interaction, vc, query, tracks):
     artist_session[interaction.guild_id] = {"query": query, "seen": {t["title"].lower() for t in tracks}}
     batch = next(batch_ids)
     tracks = [dict(t, batch=batch, artist=query, requester=requester(interaction)) for t in tracks]
-    queue = get_queue(interaction.guild_id)
     busy = vc.is_playing() or vc.is_paused() or interaction.guild_id in loading
-    queue.extend(tracks)
+    enqueue(interaction.guild_id, tracks)
     verb = "Queued" if busy else "Playing"
     await interaction.followup.send(
         f"🎤 {verb} the top {len(tracks)} songs for **{query.title()}**. "
@@ -735,8 +822,7 @@ async def add(interaction: discord.Interaction, query: str, position: int = None
         idx = max(0, min(position - 1, len(queue)))
         queue.insert(idx, track)
     else:
-        idx = len(queue)
-        queue.append(track)
+        idx = enqueue(interaction.guild_id, [track]) - 1
     await interaction.followup.send(f"➕ Queued #{idx + 1}: {label(track)}")
 
     vc = interaction.guild.voice_client
@@ -857,6 +943,71 @@ async def show_queue(interaction: discord.Interaction):
         lines.append(f"*…and {len(queue) - 25} more*")
     e.description = "\n".join(lines)[:4000] if lines else "*Nothing queued.*"
     await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+@bot.tree.command(name="radio", description="Turn endless radio on or off (plays similar songs when the queue runs out)")
+@app_commands.guild_only()
+async def radio(interaction: discord.Interaction):
+    gid = interaction.guild_id
+    if gid in radio_off:
+        radio_off.discard(gid)
+        msg = "📻 Radio **on**. When the queue runs out I'll keep playing similar songs."
+    else:
+        radio_off.add(gid)
+        queue = get_queue(gid)
+        queue[:] = [t for t in queue if not t.get("radio")]
+        msg = "📻 Radio **off**. Music stops when the queue runs out."
+    await interaction.response.send_message(msg)
+    await refresh_panel(interaction.guild)
+
+
+SPOTIFY_TRACK = re.compile(r"https?://open\.spotify\.com/(?:intl-\w+/)?track/\w+")
+YOUTUBE_LINK = re.compile(r"https?://(?:www\.|m\.|music\.)?(?:youtube\.com/(?:watch\?\S*v=|shorts/)|youtu\.be/)[\w-]{11}\S*")
+
+
+def spotify_to_query(url):
+    """Spotify track page -> 'Artist Title' to search on YouTube (no Spotify account needed)."""
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    page = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", "ignore")
+    title = re.search(r'<meta property="og:title" content="([^"]*)"', page)
+    desc = re.search(r'<meta property="og:description" content="([^"]*)"', page)
+    if not title:
+        raise LookupError("no title on Spotify page")
+    artist = desc.group(1).split(" · ")[0] if desc else ""
+    return html.unescape(f"{artist} {title.group(1)}".strip())
+
+
+async def query_from_message(message):
+    texts = [message.content] + [e.url or "" for e in message.embeds]
+    blob = " ".join(texts)
+    yt = YOUTUBE_LINK.search(blob)
+    if yt:
+        return yt.group(0)
+    sp = SPOTIFY_TRACK.search(blob)
+    if sp:
+        return await asyncio.to_thread(spotify_to_query, sp.group(0))
+    text = re.sub(r"<[^>]+>|https?://\S+", "", message.content).strip()  # drop mentions/emoji/links
+    if 0 < len(text) <= 100:
+        return text  # treat short plain text ("gucci mane", "poppin") as a search
+    return None
+
+
+@app_commands.context_menu(name="Play in voice")
+@app_commands.guild_only()
+async def play_in_voice(interaction: discord.Interaction, message: discord.Message):
+    await interaction.response.defer()
+    try:
+        query = await query_from_message(message)
+    except Exception:
+        log.exception("Couldn't read song from message")
+        query = None
+    if not query:
+        await interaction.followup.send("Couldn't find a song link or name in that message.")
+        return
+    await handle_play(interaction, query)
+
+
+bot.tree.add_command(play_in_voice)
 
 
 @bot.tree.command(name="nowplaying", description="Bring the live Now Playing panel to this channel")
