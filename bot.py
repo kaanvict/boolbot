@@ -74,7 +74,7 @@ batch_ids = itertools.count(1)  # tags each artist batch so /skipartist can drop
 current_source: dict[int, "YTDLSource"] = {}  # for elapsed time
 panels: dict[int, discord.Message] = {}  # guild -> live now-playing message
 panel_channel: dict[int, int] = {}  # guild -> channel id of the last command (fallback home)
-PANEL_REFRESH = 1  # seconds (about the most Discord allows per channel)
+PANEL_REFRESH = 2  # seconds. Discord allows ~5 edits / 5s per channel; 2s leaves room for song changes and buttons
 radio_off: set[int] = set()  # guilds that turned endless radio off
 status_channel: dict[int, int] = {}  # guild -> voice channel whose status we set
 played_ids: dict[int, list[str]] = {}  # recent video ids per guild, so radio avoids repeats
@@ -101,7 +101,17 @@ def search_track(query):
             "title": info.get("title", "Unknown"),
             "webpage_url": info.get("webpage_url") or query,
             "duration": info.get("duration") or 0,
+            "by": artist_of(info),
         }
+
+
+def artist_of(info):
+    """Artist name from yt-dlp info: proper music metadata first, else the channel."""
+    artists = info.get("artists") or ([info["artist"]] if info.get("artist") else [])
+    if artists:
+        return ", ".join(artists[:2])
+    channel = info.get("channel") or info.get("uploader") or ""
+    return re.sub(r"\s*-\s*Topic$|VEVO$", "", channel).strip()
 
 
 SPOTIFY_MAX = 50  # songs taken from one playlist/album link
@@ -232,6 +242,14 @@ def fmt(seconds):
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
+def song_name(track):
+    """'Artist - Title', unless the title already names the artist ('The Weeknd - Blinding Lights')."""
+    title, by = track["title"], (track.get("by") or "").strip()
+    if not by or by.split(",")[0].strip().lower() in title.lower():
+        return title
+    return f"{by} - {title}"
+
+
 def label(track):
     d = fmt(track["duration"])
     return f"**{track['title']}**" + (f" [{d}]" if d else "")
@@ -322,12 +340,13 @@ async def announce(guild, msg, skip_channel_id=None):
 
 
 async def fill_metadata(track):
-    """Artist-mix songs come without a duration; look it up while the stream loads."""
-    if track.get("duration"):
+    """Artist-mix songs come without a duration or artist; look them up while the stream loads."""
+    if track.get("duration") and track.get("by") is not None:
         return
     try:
         meta = await asyncio.to_thread(search_track, track["webpage_url"])
-        track["duration"] = meta["duration"]
+        track["duration"] = track.get("duration") or meta["duration"]
+        track["by"] = meta["by"]
     except Exception:
         log.warning("Couldn't fetch metadata for %s", track["title"])
 
@@ -360,7 +379,7 @@ async def start_track(guild, vc, track):
         recent.append(vid)
         del recent[:-200]
     await set_presence(track)
-    await set_vc_status(guild, f"🎵 {track['title']}")
+    await set_vc_status(guild, f"🎵 {song_name(track)}")
     await post_panel(guild)
 
 
