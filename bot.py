@@ -104,6 +104,63 @@ def search_track(query):
         }
 
 
+SPOTIFY_MAX = 50  # songs taken from one playlist/album link
+SPOTIFY_URL = re.compile(r"https?://open\.spotify\.com/(?:intl-[\w-]+/)?(track|album|playlist|artist)/(\w+)")
+SPOTIFY_ANY = re.compile(r"https?://(?:open\.spotify\.com|spotify\.link|spotify\.app\.link)/\S+")
+
+
+def _fetch(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return r.geturl(), r.read().decode("utf-8", "ignore")
+
+
+def _clean(s):
+    return re.sub(r"\s+", " ", html.unescape(s or "")).strip()
+
+
+def spotify_resolve(url):
+    """Spotify link -> (kind, name, ['Title Artist', ...]) using the public embed page.
+
+    No Spotify account or API key needed. Short links (spotify.link/...) are followed first."""
+    m = SPOTIFY_URL.search(url)
+    if not m:
+        final, page = _fetch(url)
+        m = SPOTIFY_URL.search(final) or SPOTIFY_URL.search(page)
+        if not m:
+            raise LookupError("not a Spotify track, album, playlist or artist link")
+    kind, sid = m.groups()
+    _, page = _fetch(f"https://open.spotify.com/embed/{kind}/{sid}")
+    data = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', page, re.S)
+    if not data:
+        raise LookupError("Spotify page had no data")
+    ent = json.loads(data.group(1))["props"]["pageProps"]["state"]["data"]["entity"]
+    name = _clean(ent.get("name") or ent.get("title"))
+    if kind == "track":
+        artists = " ".join(a.get("name", "") for a in ent.get("artists") or [])
+        queries = [_clean(f"{name} {artists}")]
+    else:
+        queries = [_clean(f"{t.get('title', '')} {t.get('subtitle', '')}".replace(",", " "))
+                   for t in ent.get("trackList") or [] if t.get("title")][:SPOTIFY_MAX]
+    if not queries:
+        raise LookupError("no songs found on that Spotify page")
+    return kind, name, queries
+
+
+async def expand_spotify(interaction, query):
+    """If the query is a Spotify link, return (kind, name, search queries); else None.
+    Sends an error and returns False when the link can't be read."""
+    sp = SPOTIFY_ANY.search(query or "")
+    if not sp:
+        return None
+    try:
+        return await asyncio.to_thread(spotify_resolve, sp.group(0))
+    except Exception as e:
+        log.warning("Spotify link failed %s: %s", sp.group(0), e)
+        await interaction.followup.send("Couldn't read that Spotify link. Is it public?")
+        return False
+
+
 ARTIST_TRACKS = 10
 STOPWORDS = {"the", "a", "an", "of", "and", "feat", "ft", "x", "with", "by", "official", "music", "video", "audio"}
 
@@ -132,6 +189,18 @@ def music_search(query, limit=ARTIST_TRACKS + 5):
             "duration": e.get("duration") or 0,
         })
     return tracks
+
+
+def song_match(query):
+    """Best official-audio match for a known song (used for Spotify links); avoids live
+    versions and age-gated music videos. Falls back to a normal YouTube search."""
+    try:
+        songs = music_search(query, 3)
+        if songs:
+            return songs[0]
+    except Exception:
+        log.warning("YouTube Music lookup failed for %r, using YouTube search", query)
+    return search_track(query)
 
 
 def artist_tracks(query):
@@ -817,7 +886,7 @@ def requester(interaction):
 
 
 @bot.tree.command(name="play", description="Play a song or an artist's top songs (empty = resume)")
-@app_commands.describe(query="Song, artist, URL, or a list: 'a, b, c' or 'artist: a, b, c' (empty = resume)")
+@app_commands.describe(query="Song, artist, YouTube/Spotify link, or 'a, b, c' / 'artist: a, b, c' (empty = resume)")
 @app_commands.guild_only()
 async def play(interaction: discord.Interaction, query: str = None):
     await interaction.response.defer()
@@ -866,11 +935,16 @@ def split_query(query):
     return parts
 
 
-async def search_many(parts, who):
+async def search_many(parts, who, finder=None):
     """Search all parts at once; return (tracks in the given order, parts that failed)."""
-    results = await asyncio.gather(
-        *(asyncio.to_thread(search_track, p) for p in parts), return_exceptions=True
-    )
+    gate = asyncio.Semaphore(8)  # big Spotify playlists: don't launch 50 searches at once
+    finder = finder or search_track
+
+    async def one(p):
+        async with gate:
+            return await asyncio.to_thread(finder, p)
+
+    results = await asyncio.gather(*(one(p) for p in parts), return_exceptions=True)
     tracks, missing = [], []
     for part, res in zip(parts, results):
         if isinstance(res, Exception):
@@ -882,11 +956,14 @@ async def search_many(parts, who):
     return tracks, missing
 
 
-def list_reply(tracks, start, missing, verb="Queued"):
-    lines = [f"🎶 {verb} {len(tracks)} songs:"]
-    lines += [f"`{start + i}.` {label(t)}" for i, t in enumerate(tracks)]
+def list_reply(tracks, start, missing, verb="Queued", source=None, show=15):
+    head = f"🎶 {verb} {len(tracks)} songs" + (f" from {source}" if source else "") + ":"
+    lines = [head] + [f"`{start + i}.` {label(t)}" for i, t in enumerate(tracks[:show])]
+    if len(tracks) > show:
+        lines.append(f"*…and {len(tracks) - show} more. `/queue` shows them all.*")
     if missing:
-        lines.append("❓ Couldn't find: " + ", ".join(f"*{m}*" for m in missing))
+        names = ", ".join(f"*{m}*" for m in missing[:10]) + (f" +{len(missing) - 10} more" if len(missing) > 10 else "")
+        lines.append("❓ Couldn't find: " + names)
     return "\n".join(lines)[:2000]
 
 
@@ -896,31 +973,50 @@ async def handle_play(interaction, query):
     if not vc:
         return
 
-    parts = split_query(query)
+    spotify = await expand_spotify(interaction, query)
+    if spotify is False:
+        return
+    source = None
+    if spotify:
+        kind, name, parts = spotify
+        if len(parts) > 1:
+            await interaction.followup.send(f"🟢 Finding {len(parts)} songs from Spotify {kind} **{name}**…")
+        if kind == "artist":
+            tracks, _ = await search_many(parts, requester(interaction), song_match)
+            if not tracks:
+                await interaction.followup.send(f"Couldn't find songs for **{name}**.")
+                return
+            await play_artist(interaction, vc, name, tracks)
+            return
+        source = f"Spotify {kind} **{name}**"
+    else:
+        parts = split_query(query)
+
+    finder = song_match if spotify else search_track
     if len(parts) > 1:
-        tracks, missing = await search_many(parts, requester(interaction))
+        tracks, missing = await search_many(parts, requester(interaction), finder)
         if not tracks:
             await interaction.followup.send("Couldn't find any of those.")
             return
         busy = vc.is_playing() or vc.is_paused() or interaction.guild_id in loading
         pos = enqueue(interaction.guild_id, tracks)
         if busy:
-            await interaction.followup.send(list_reply(tracks, pos, missing))
+            await interaction.followup.send(list_reply(tracks, pos, missing, source=source))
             await refresh_panel(interaction.guild)
         else:
-            await interaction.followup.send(list_reply(tracks, 1, missing, verb="Playing"))
+            await interaction.followup.send(list_reply(tracks, 1, missing, verb="Playing", source=source))
             await play_next(interaction.guild)
         return
     if parts:
         query = parts[0]  # e.g. 'yung lean: kyoto' -> 'yung lean kyoto'
 
-    tracks = await asyncio.to_thread(artist_tracks, query)
+    tracks = None if spotify else await asyncio.to_thread(artist_tracks, query)
     if tracks:
         await play_artist(interaction, vc, query, tracks)
         return
 
     try:
-        track = await asyncio.to_thread(search_track, query)
+        track = await asyncio.to_thread(finder, query)
     except Exception:
         log.exception("Search failed: %s", query)
         await interaction.followup.send(f"Couldn't find anything for: {query}")
@@ -959,12 +1055,17 @@ async def play_artist(interaction, vc, query, tracks):
 
 
 @bot.tree.command(name="add", description="Add songs to the queue (separate several with commas)")
-@app_commands.describe(query="Song name, YouTube URL, or a comma-separated list",
+@app_commands.describe(query="Song name, YouTube/Spotify link, or a comma-separated list",
                        position="Queue position (optional)")
 @app_commands.guild_only()
 async def add(interaction: discord.Interaction, query: str, position: int = None):
     await interaction.response.defer()
-    tracks, missing = await search_many(split_query(query), requester(interaction))
+    spotify = await expand_spotify(interaction, query)
+    if spotify is False:
+        return
+    parts = spotify[2] if spotify else split_query(query)
+    source = f"Spotify {spotify[0]} **{spotify[1]}**" if spotify and len(parts) > 1 else None
+    tracks, missing = await search_many(parts, requester(interaction), song_match if spotify else None)
     if not tracks:
         await interaction.followup.send(f"Couldn't find anything for: {query}")
         return
@@ -978,7 +1079,7 @@ async def add(interaction: discord.Interaction, query: str, position: int = None
     if len(tracks) == 1 and not missing:
         await interaction.followup.send(f"➕ Queued #{idx + 1}: {label(tracks[0])}")
     else:
-        await interaction.followup.send(list_reply(tracks, idx + 1, missing))
+        await interaction.followup.send(list_reply(tracks, idx + 1, missing, source=source))
 
     vc = interaction.guild.voice_client
     if vc and vc.is_connected() and not (vc.is_playing() or vc.is_paused()) and interaction.guild_id not in loading:
@@ -1116,20 +1217,7 @@ async def radio(interaction: discord.Interaction):
     await refresh_panel(interaction.guild)
 
 
-SPOTIFY_TRACK = re.compile(r"https?://open\.spotify\.com/(?:intl-\w+/)?track/\w+")
 YOUTUBE_LINK = re.compile(r"https?://(?:www\.|m\.|music\.)?(?:youtube\.com/(?:watch\?\S*v=|shorts/)|youtu\.be/)[\w-]{11}\S*")
-
-
-def spotify_to_query(url):
-    """Spotify track page -> 'Artist Title' to search on YouTube (no Spotify account needed)."""
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-    page = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", "ignore")
-    title = re.search(r'<meta property="og:title" content="([^"]*)"', page)
-    desc = re.search(r'<meta property="og:description" content="([^"]*)"', page)
-    if not title:
-        raise LookupError("no title on Spotify page")
-    artist = desc.group(1).split(" · ")[0] if desc else ""
-    return html.unescape(f"{artist} {title.group(1)}".strip())
 
 
 async def query_from_message(message):
@@ -1138,9 +1226,9 @@ async def query_from_message(message):
     yt = YOUTUBE_LINK.search(blob)
     if yt:
         return yt.group(0)
-    sp = SPOTIFY_TRACK.search(blob)
+    sp = SPOTIFY_ANY.search(blob)
     if sp:
-        return await asyncio.to_thread(spotify_to_query, sp.group(0))
+        return sp.group(0)  # handle_play resolves it
     text = re.sub(r"<[^>]+>|https?://\S+", "", message.content).strip()  # drop mentions/emoji/links
     if 0 < len(text) <= 100:
         return text  # treat short plain text ("gucci mane", "poppin") as a search
