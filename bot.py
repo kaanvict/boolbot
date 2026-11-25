@@ -1282,6 +1282,52 @@ async def nowplaying(interaction: discord.Interaction):
     await post_panel(interaction.guild, channel=interaction.channel)
 
 
+RESTART_CODE = 3        # tells BoolBot.vbs to start the bot again
+WATCHDOG_OFFLINE = 300  # seconds without a live Discord connection before restarting
+WATCHDOG_FROZEN = 180   # seconds the event loop may go without a beat
+_beat = {"loop": time.monotonic(), "healthy": time.monotonic()}
+
+
+def gateway_ok():
+    """True if Discord answered our gateway heartbeat in the last 2 minutes."""
+    ka = getattr(bot.ws, "_keep_alive", None) if bot.ws else None
+    return bool(ka) and not bot.is_closed() and time.perf_counter() - ka._last_ack < 120
+
+
+async def watchdog_beat():
+    while True:
+        now = time.monotonic()
+        _beat["loop"] = now
+        if gateway_ok():
+            _beat["healthy"] = now
+        await asyncio.sleep(15)
+
+
+def watchdog_thread():
+    """Runs outside the event loop, so it still works if the bot is frozen."""
+    while True:
+        time.sleep(30)
+        now = time.monotonic()
+        if now - _beat["loop"] > WATCHDOG_FROZEN:
+            reason = f"event loop frozen for {now - _beat['loop']:.0f}s"
+        elif now - _beat["healthy"] > WATCHDOG_OFFLINE:
+            reason = f"no Discord connection for {now - _beat['healthy']:.0f}s"
+        else:
+            continue
+        log.error("Watchdog: %s. Restarting.", reason)
+        logging.shutdown()
+        os._exit(RESTART_CODE)
+
+
+async def _setup_hook():
+    asyncio.get_running_loop().create_task(watchdog_beat())
+    import threading
+    threading.Thread(target=watchdog_thread, daemon=True, name="watchdog").start()
+
+
+bot.setup_hook = _setup_hook
+
+
 def single_instance_lock():
     """Prevent two copies running at once (e.g. double-clicking the launcher)."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -1304,5 +1350,6 @@ if __name__ == "__main__":
         log.error("Discord rejected the token. Reset it in the Developer Portal and update .env.")
         sys.exit(1)
     except Exception:
-        log.exception("BoolBot crashed")
-        raise
+        log.exception("BoolBot crashed. Restarting.")
+        logging.shutdown()
+        sys.exit(RESTART_CODE)
