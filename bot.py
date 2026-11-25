@@ -866,6 +866,9 @@ async def on_guild_join(guild):
 @bot.listen("on_interaction")
 async def remember_channel(interaction):
     # The panel lives in #boolbot if it exists, else wherever commands were last used.
+    name = (interaction.data or {}).get("name") or (interaction.data or {}).get("custom_id")
+    log.info("Interaction %s from %s in %s", name, interaction.user,
+             interaction.guild.name if interaction.guild else "DM")
     if interaction.guild and interaction.type == discord.InteractionType.application_command:
         panel_channel[interaction.guild.id] = interaction.channel_id
 
