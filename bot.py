@@ -378,9 +378,59 @@ async def start_track(guild, vc, track):
         recent = played_ids.setdefault(guild.id, [])
         recent.append(vid)
         del recent[:-200]
+        record_history(guild, track, vid)
     await set_presence(track)
     await set_vc_status(guild, f"🎵 {song_name(track)}")
     await post_panel(guild)
+
+
+HISTORY_FILE = HERE / "history.jsonl"  # one line per song played, survives restarts
+PLAYLIST_CHUNK = 38  # video ids per link: Discord link buttons max out at 512 characters
+
+
+def record_history(guild, track, vid):
+    entry = {"t": int(time.time()), "guild": guild.id, "id": vid, "title": track["title"],
+             "by": track.get("by") or "", "requester": track.get("requester") or "",
+             "radio": bool(track.get("radio"))}
+    try:
+        with open(HISTORY_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        log.exception("Couldn't write history")
+
+
+def load_history(guild_id, count, who=None, today=False):
+    """Most recent `count` distinct songs for a guild, oldest first."""
+    try:
+        lines = HISTORY_FILE.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return []
+    midnight = time.mktime(time.localtime()[:3] + (0, 0, 0, 0, 0, -1))
+    picked, seen = [], set()
+    for line in reversed(lines):
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if e.get("guild") != guild_id or e["id"] in seen:
+            continue
+        if today and e["t"] < midnight:
+            break
+        if who and e.get("requester", "").lower() not in who:
+            continue
+        seen.add(e["id"])
+        picked.append(e)
+        if len(picked) >= count:
+            break
+    return picked[::-1]
+
+
+def playlist_links(ids):
+    """Anonymous YouTube playlists (no sign-in): youtube.com/watch_videos?video_ids=a,b,c"""
+    return [
+        "https://www.youtube.com/watch_videos?video_ids=" + ",".join(ids[i:i + PLAYLIST_CHUNK])
+        for i in range(0, len(ids), PLAYLIST_CHUNK)
+    ]
 
 
 def mix_search(seed_id, exclude, limit=RADIO_BATCH):
@@ -1273,6 +1323,38 @@ async def play_in_voice(interaction: discord.Interaction, message: discord.Messa
 
 
 bot.tree.add_command(play_in_voice)
+
+
+@bot.tree.command(name="history", description="Songs played here, as a one-click YouTube playlist (only you see it)")
+@app_commands.describe(count="How many recent songs (default 25, max 100)",
+                       who="Only songs this person queued",
+                       today="Only songs played today")
+@app_commands.guild_only()
+async def history(interaction: discord.Interaction, count: app_commands.Range[int, 1, 100] = 25,
+                  who: discord.Member = None, today: bool = False):
+    names = {n.lower() for n in (who.display_name, who.global_name, who.name) if n} if who else None
+    songs = load_history(interaction.guild_id, count, names, today)
+    if not songs:
+        await interaction.response.send_message("No songs in the history for that yet.", ephemeral=True)
+        return
+    scope = ("today" if today else "recently") + (f" queued by {who.display_name}" if who else "")
+    e = discord.Embed(title=f"🕘 {len(songs)} songs played {scope}", color=ACCENT_PLAYING)
+    lines = [f"`{i}.` [{trim(song_name(s), 80)}](https://youtu.be/{s['id']})" for i, s in enumerate(songs, 1)]
+    text = ""
+    for i, line in enumerate(lines):
+        if len(text) + len(line) > 3900:
+            text += f"\n*…and {len(lines) - i} more (all in the playlist)*"
+            break
+        text += line + "\n"
+    e.description = text
+    e.set_footer(text="Buttons open the songs as a YouTube playlist. No sign-in needed.")
+    view = discord.ui.View()
+    links = playlist_links([s["id"] for s in songs])
+    for n, url in enumerate(links):
+        lo, hi = n * PLAYLIST_CHUNK + 1, min((n + 1) * PLAYLIST_CHUNK, len(songs))
+        label = "▶ Open as playlist" if len(links) == 1 else f"▶ Songs {lo}–{hi}"
+        view.add_item(discord.ui.Button(label=label, url=url))
+    await interaction.response.send_message(embed=e, view=view, ephemeral=True)
 
 
 @bot.tree.command(name="nowplaying", description="Bring the live Now Playing panel to this channel")

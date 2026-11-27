@@ -4,3 +4,4 @@ __pycache__/
 boolbot.log
 tools.log
 panels.json
+history.jsonl
